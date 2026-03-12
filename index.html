@@ -171,12 +171,12 @@
 <div class="sliders">
   <div class="slider-group">
     <label>文字サイズ 最小</label>
-    <input type="range" id="slider-min" min="3" max="20" value="5">
+    <input type="range" id="slider-min" min="3" max="30" value="8">
     <span class="value" id="val-min">5px</span>
   </div>
   <div class="slider-group">
     <label>文字サイズ 最大</label>
-    <input type="range" id="slider-max" min="8" max="60" value="24">
+    <input type="range" id="slider-max" min="8" max="80" value="32">
     <span class="value" id="val-max">24px</span>
   </div>
   <div class="slider-group">
@@ -195,6 +195,16 @@
     <span class="value" id="val-edge">50</span>
   </div>
   <div class="slider-group">
+    <label>文字変形</label>
+    <input type="range" id="slider-deform" min="0" max="300" value="100">
+    <span class="value" id="val-deform">100%</span>
+  </div>
+  <div class="slider-group">
+    <label>元画像ブレンド</label>
+    <input type="range" id="slider-blend" min="0" max="100" value="0">
+    <span class="value" id="val-blend">0%</span>
+  </div>
+  <div class="slider-group">
     <label>明暗しきい値</label>
     <input type="range" id="slider-threshold" min="0" max="255" value="240">
     <span class="value" id="val-threshold">240</span>
@@ -207,6 +217,7 @@
 </div>
 
 <div class="actions">
+  <button class="btn" id="btn-auto" style="border-color:#D4A537;color:#D4A537">自動推奨設定</button>
   <button class="btn" id="btn-render">再描画</button>
   <button class="btn" id="btn-save">PNG保存</button>
 </div>
@@ -243,6 +254,8 @@ const sliderMax       = $('slider-max');
 const sliderDensity   = $('slider-density');
 const sliderContrast  = $('slider-contrast');
 const sliderEdge      = $('slider-edge');
+const sliderDeform    = $('slider-deform');
+const sliderBlend     = $('slider-blend');
 const sliderThreshold = $('slider-threshold');
 const selectBg        = $('select-bg');
 const selectMode      = $('select-mode');
@@ -477,20 +490,30 @@ function render() {
         ctx.fillStyle = isDark
           ? `rgba(255,255,255,${c.alpha})`
           : `rgba(0,0,0,${c.alpha})`;
-        if (c.angle !== 0) {
-          const cos = Math.cos(c.angle), sin = Math.sin(c.angle);
-          ctx.setTransform(cos, sin, -sin, cos, c.x, c.y);
-          ctx.fillText(c.char, 0, 0);
-        } else {
-          ctx.setTransform(1, 0, 0, 1, 0, 0);
-          ctx.fillText(c.char, c.x, c.y);
-        }
+        // 回転 + スケール変形を合成した変換行列
+        // [sx*cos, sx*sin, -sy*sin, sy*cos, tx, ty]
+        const cos = Math.cos(c.angle), sin = Math.sin(c.angle);
+        ctx.setTransform(
+          c.sx * cos,  c.sx * sin,
+          -c.sy * sin, c.sy * cos,
+          c.x, c.y
+        );
+        ctx.fillText(c.char, 0, 0);
         charCount++;
       }
     }
   }
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+  // 元画像ブレンド
+  const blendAmount = parseInt(sliderBlend.value) / 100;
+  if (blendAmount > 0 && state.image) {
+    ctx.globalAlpha = blendAmount;
+    ctx.drawImage(state.image, 0, 0, w, h);
+    ctx.globalAlpha = 1;
+  }
+
   const ms = (performance.now() - t0).toFixed(0);
   statusEl.textContent = `${ms}ms / ${charCount}文字 / ${mode}`;
 }
@@ -502,18 +525,18 @@ function renderContour(w, h, isDark, minSize, maxSize, step, text) {
   if (!state.contours || state.contours.length === 0) return 0;
 
   const cmap = state.contrastMap;
+  const mags = state.edgeMagnitudes;
   const fontFamily = '"Hiragino Kaku Gothic ProN", sans-serif';
+  const deformFactor = parseInt(sliderDeform.value) / 100;
   let charCount = 0;
-  let ci = 0; // テキストインデックス（全パスで共有）
+  let ci = 0;
 
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
 
-  // 文字間隔（stepに基づく）
   const charSpacing = step * 1.2;
 
   for (const rawPath of state.contours) {
-    // パスを滑らかにする
     const path = smoothPath(rawPath, 3);
 
     // パスに沿って累積距離を計算
@@ -526,12 +549,22 @@ function renderContour(w, h, isDark, minSize, maxSize, step, text) {
     const totalLength = distances[distances.length - 1];
     if (totalLength < charSpacing) continue;
 
-    // パス上を等間隔で歩いて文字を配置
+    // パスの曲率を事前計算（前後の角度差）
+    const curvatures = new Float32Array(path.length);
+    for (let i = 2; i < path.length - 2; i++) {
+      const ax = path[i].x - path[i-2].x, ay = path[i].y - path[i-2].y;
+      const bx = path[i+2].x - path[i].x, by = path[i+2].y - path[i].y;
+      const a1 = Math.atan2(ay, ax), a2 = Math.atan2(by, bx);
+      let diff = a2 - a1;
+      if (diff > Math.PI) diff -= 2 * Math.PI;
+      if (diff < -Math.PI) diff += 2 * Math.PI;
+      curvatures[i] = Math.abs(diff);
+    }
+
     let dist = 0;
     let pathIdx = 0;
 
     while (dist < totalLength) {
-      // 現在の距離に対応するパス上の位置を補間
       while (pathIdx < distances.length - 1 && distances[pathIdx + 1] < dist) {
         pathIdx++;
       }
@@ -542,13 +575,21 @@ function renderContour(w, h, isDark, minSize, maxSize, step, text) {
       const px = path[pathIdx].x + (path[pathIdx + 1].x - path[pathIdx].x) * t;
       const py = path[pathIdx].y + (path[pathIdx + 1].y - path[pathIdx].y) * t;
 
-      // 接線方向（この位置での進行方向）
+      // 接線方向
       const lookAhead = Math.min(pathIdx + 3, path.length - 1);
-      const tangentX = path[lookAhead].x - path[Math.max(0, pathIdx - 1)].x;
-      const tangentY = path[lookAhead].y - path[Math.max(0, pathIdx - 1)].y;
+      const lookBack = Math.max(0, pathIdx - 1);
+      const tangentX = path[lookAhead].x - path[lookBack].x;
+      const tangentY = path[lookAhead].y - path[lookBack].y;
       const angle = Math.atan2(tangentY, tangentX);
 
-      // この位置の明度で文字サイズを決定
+      // 曲率に応じた変形: 直線部分は伸ばし、曲がり部分は圧縮
+      const curv = (pathIdx < curvatures.length) ? curvatures[pathIdx] : 0;
+      const curvNorm = Math.min(curv / 0.5, 1); // 0〜1に正規化
+      // 直線部分: 接線方向に伸ばす / 曲がり部分: 圧縮
+      const sx = 1 + (1 - curvNorm) * deformFactor * 1.2;
+      const sy = 1 / (1 + curvNorm * deformFactor * 0.5);
+
+      // 明度で文字サイズ
       const ix = px | 0, iy = py | 0;
       const idx = iy * w + ix;
       const brightness = (ix >= 0 && ix < w && iy >= 0 && iy < h) ? cmap[idx] : 128;
@@ -565,7 +606,11 @@ function renderContour(w, h, isDark, minSize, maxSize, step, text) {
         : `rgba(0,0,0,${alpha})`;
 
       const cos = Math.cos(angle), sin = Math.sin(angle);
-      ctx.setTransform(cos, sin, -sin, cos, px, py);
+      ctx.setTransform(
+        sx * cos,  sx * sin,
+        -sy * sin, sy * cos,
+        px, py
+      );
       ctx.fillText(char, 0, 0);
       charCount++;
 
@@ -584,6 +629,7 @@ function collectChars(w, h, step, threshold, text, isFlow, minSize, sizeRange, b
   const cmap = state.contrastMap;
   const angles = state.edgeAngles;
   const mags = state.edgeMagnitudes;
+  const deformFactor = parseInt(sliderDeform.value) / 100;
   let ci = 0;
 
   if (isFlow) {
@@ -599,7 +645,12 @@ function collectChars(w, h, step, threshold, text, isFlow, minSize, sizeRange, b
           const bucket = Math.min(buckets - 1, (t * buckets) | 0);
           const alpha = (0.2 + 0.8 * t).toFixed(2);
           const angle = (idx < angles.length) ? angles[idx] : 0;
-          result[bucket].push({ x, y, char: text[ci % text.length], alpha, angle });
+          // エッジの強さに応じた変形量
+          const mag = (idx < mags.length) ? mags[idx] : 0;
+          const normMag = Math.min(mag / 200, 1);
+          const sx = 1 + normMag * deformFactor * 1.5; // エッジ方向に引き伸ばし
+          const sy = 1 / (1 + normMag * deformFactor * 0.3); // 直交方向を圧縮
+          result[bucket].push({ x, y, char: text[ci % text.length], alpha, angle, sx, sy });
           ci++;
         }
         const eidx = (y | 0) * w + (x | 0);
@@ -619,8 +670,13 @@ function collectChars(w, h, step, threshold, text, isFlow, minSize, sizeRange, b
         const t = 1 - brightness / 255;
         const bucket = Math.min(buckets - 1, (t * buckets) | 0);
         const alpha = (0.2 + 0.8 * t).toFixed(2);
-        const angle = (mags[idx] > edgeSensitivity) ? angles[idx] : 0;
-        result[bucket].push({ x, y, char: text[ci % text.length], alpha, angle });
+        const mag = mags[idx];
+        const angle = (mag > edgeSensitivity) ? angles[idx] : 0;
+        // エッジの強さに応じた変形量
+        const normMag = Math.min(mag / 200, 1);
+        const sx = 1 + normMag * deformFactor * 1.5;
+        const sy = 1 / (1 + normMag * deformFactor * 0.3);
+        result[bucket].push({ x, y, char: text[ci % text.length], alpha, angle, sx, sy });
         ci++;
       }
     }
@@ -637,13 +693,15 @@ function updateSliderLabels() {
   $('val-density').textContent   = sliderDensity.value;
   $('val-contrast').textContent  = sliderContrast.value + '%';
   $('val-edge').textContent      = sliderEdge.value;
+  $('val-deform').textContent    = sliderDeform.value + '%';
+  $('val-blend').textContent     = sliderBlend.value + '%';
   $('val-threshold').textContent = sliderThreshold.value;
 }
 
 // ============================================================
 // イベント
 // ============================================================
-[sliderMin, sliderMax, sliderDensity, sliderThreshold].forEach(s => {
+[sliderMin, sliderMax, sliderDensity, sliderDeform, sliderBlend, sliderThreshold].forEach(s => {
   s.addEventListener('input', () => { updateSliderLabels(); scheduleRender(); });
 });
 
@@ -663,6 +721,75 @@ sliderEdge.addEventListener('input', () => {
 selectBg.addEventListener('change', scheduleRender);
 selectMode.addEventListener('change', scheduleRender);
 $('btn-render').addEventListener('click', render);
+
+// 自動推奨設定: 画像の特性を分析してパラメータを自動決定
+$('btn-auto').addEventListener('click', () => {
+  if (!state.imageData || !state.edgeMagnitudes) return;
+
+  const g = state.imageData;
+  const mags = state.edgeMagnitudes;
+  const len = g.length;
+
+  // 1. 平均明度
+  let sumBright = 0;
+  for (let i = 0; i < len; i++) sumBright += g[i];
+  const avgBright = sumBright / len;
+
+  // 2. エッジ密度（強いエッジの割合）
+  let edgeCount = 0;
+  for (let i = 0; i < len; i++) if (mags[i] > 40) edgeCount++;
+  const edgeDensity = edgeCount / len;
+
+  // 3. 明暗の分散（コントラストの指標）
+  let sumVar = 0;
+  for (let i = 0; i < len; i++) {
+    const d = g[i] - avgBright;
+    sumVar += d * d;
+  }
+  const stdDev = Math.sqrt(sumVar / len);
+
+  // --- パラメータ計算 ---
+
+  // コントラストが低い画像は強調、高い画像はそのまま
+  const contrastVal = stdDev < 40 ? 150 : stdDev < 60 ? 120 : 100;
+
+  // エッジが多い画像は密度を下げて見やすく、少ない画像は上げる
+  const densityVal = edgeDensity > 0.15 ? 4 : edgeDensity > 0.08 ? 6 : 7;
+
+  // 明るい画像はしきい値を上げる、暗い画像は下げる
+  const thresholdVal = Math.round(Math.min(250, avgBright + stdDev * 1.5));
+
+  // エッジ感度: エッジが多すぎる画像は感度を上げてノイズを減らす
+  const edgeVal = edgeDensity > 0.15 ? 80 : edgeDensity > 0.08 ? 50 : 30;
+
+  // 文字サイズ: エッジ密度に応じて調整
+  const minSizeVal = edgeDensity > 0.12 ? 10 : 8;
+  const maxSizeVal = edgeDensity > 0.12 ? 28 : 36;
+
+  // 変形: 中程度
+  const deformVal = 80;
+
+  // ブレンド: 元画像がうっすら見える程度
+  const blendVal = 15;
+
+  // --- 適用 ---
+  sliderContrast.value  = contrastVal;
+  sliderDensity.value   = densityVal;
+  sliderThreshold.value = thresholdVal;
+  sliderEdge.value      = edgeVal;
+  sliderMin.value       = minSizeVal;
+  sliderMax.value       = maxSizeVal;
+  sliderDeform.value    = deformVal;
+  sliderBlend.value     = blendVal;
+
+  updateSliderLabels();
+  updateContrastMap();
+  extractContours();
+  render();
+
+  // 分析結果をステータスに表示
+  statusEl.textContent = `自動設定適用 — 平均明度:${avgBright.toFixed(0)} / エッジ密度:${(edgeDensity*100).toFixed(1)}% / 標準偏差:${stdDev.toFixed(0)}`;
+});
 
 $('btn-save').addEventListener('click', () => {
   const link = document.createElement('a');
